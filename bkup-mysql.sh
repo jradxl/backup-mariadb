@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -e
 trap cleanup EXIT
+trap controlC INT
 START=`date +%s`
+ERROR=0
+PID1=0 #This process's instance PID
+PID2=0 #PID obtained from Run Flag, which might not be same
 RUNDIR="/root/backup-scripts"
 
 ### MySQL Server Login Info ###
@@ -41,10 +45,6 @@ ARGS=""
 BASEBACKDIR=$BACKDIR/base
 INCRBACKDIR=$BACKDIR/incr
 
-##Use this working directory
-## cd $SCRIPTPATH
-cd $RUNDIR
-
 function logmessage()
 {
     if [ ! "$1" = "" ]
@@ -60,6 +60,12 @@ function startup()
     logmessage "\n----------------------------------------------------------\nMariaDB Backup Starting [$NOW]..." 
 }
 
+function controlC()
+{  
+    logmessage "Control C received..."
+    ERROR=1
+}
+
 function cleanup()
 {
     #TODO
@@ -69,8 +75,22 @@ function cleanup()
     SPENT=$((`date +%s` - $START))
     logmessage "took $SPENT seconds"
     logmessage "\nMariaDB Backup Finished [$NOW]\n=========================================================="
-    if [ -f ${RUNDIR}/${RUNFILE} ]; then 
-        rm ${RUNDIR}/${RUNFILE}
+    
+    if [ $ERROR ]; then
+        if [ -f ${RUNDIR}/${RUNFILE} ]; then
+            
+            #Read PID file. Assume one line!
+            while IFS= read -r PID3
+            do
+                #Scope: Copy to this shell
+                PID2=$PID3        
+            done < ${RUNDIR}/${RUNFILE}
+            
+            if [[ $PID1 -eq  $PID2 ]]; then
+                #Only delete the Run flag if was set by this instance
+                rm ${RUNDIR}/${RUNFILE}
+            fi 
+        fi
     fi
 }
 
@@ -172,10 +192,10 @@ function check_mariadb_for_change()
 function checkrunning()
 {
     # check for running process
-    if [ -f "$RUNFILE" ]; then
-        if [ $(( $(date +%s) - $(date +%s --reference $RUNFILE) )) -gt ${MAX_AGE} ]; then
+    if [ -f "${RUNDIR}/${RUNFILE}" ]; then
+        if [ $(( $(date +%s) - $(date +%s --reference "${RUNDIR}/${RUNFILE}") )) -gt ${MAX_AGE} ]; then
             logmessage "Backup process has been running too long... Continuing."
-            rm $RUNFILE;
+            rm "${RUNDIR}/${RUNFILE}";
         else 
             logmessage "Backup process is still running... Exiting."
             return 1
@@ -246,6 +266,9 @@ function dobackup()
 }
 
 ### -- Start Here --- ###
+##Use this working directory
+## cd $SCRIPTPATH
+cd $RUNDIR
 startup
 
 #Create dir for storing of change flags
@@ -260,57 +283,69 @@ then
     INFO="Continuing..."
 else
     logmessage "\nERROR: Already Running."
-    exit 1
+    ERROR=1
+fi
+
+if [[ $ERROR -eq 0 ]]; then
+    ## findmnt /mnt/sea8tb  >/dev/null 2>&1 ;
+    if mountpoint -q /mnt/sea8tb 
+    then
+        logmessage  "/mnt/sea8tb is mounted OK."
+    else
+       logmessage  "ERROR: /mnt/sea8tb is not mounted."
+       ERROR=1
+    fi
 fi
 
 #Tests the MariaDB daemon is up without needing credentials
 #Assumes only one instance on this server
-UP1=$(pgrep mysqld | wc -l);
-if [ "$UP1" -ne 1 ];
-then
-    logmessage  "MariaDB is down. Exiting"
-    exit 1
-else
-    logmessage  "MariaDB is up."
+if [[ $ERROR -eq 0 ]]; then
+    UP1=$(pgrep mysqld | wc -l);
+    if [ "$UP1" -ne 1 ];
+    then
+        logmessage  "MariaDB is down. Exiting"
+        ERROR=1
+    else
+        logmessage  "MariaDB is up."
+    fi
 fi
 
-#Test the Credentials are OK
-#only this form of execution seems to work
-#something strange about the return value
-if [ -f ${RUNDIR}/bkup-test-mysql.sh ] 
-then
-    UP3=$(${RUNDIR}/bkup-test-mysql.sh "$USEROPT")
-    case "$UP3" in
-        "Credentials not OK")
-            logmessage  "Credentials not OK. Exiting"
-        exit 1
-        ;;
-        "Credentials OK")
-            logmessage  "Credentials OK."
-        ;; 
-        *)
-            logmessage  "ERROR: Programming Error in checking Credentials"
-        exit 1
-        ;;
-    esac
-else
-    logmessage "ERROR: The subscript bkup-test-mysql.sh is missing."
-    ## Script can continue ##
+if [[ $ERROR -eq 0 ]]; then
+    #Test the Credentials are OK
+    #only this form of execution seems to work
+    #something strange about the return value
+    if [ -f ${RUNDIR}/bkup-test-mysql.sh ] 
+    then
+        UP3=$(${RUNDIR}/bkup-test-mysql.sh "$USEROPT")
+        case "$UP3" in
+            "Credentials not OK")
+                logmessage  "Credentials not OK. Exiting"
+                ERROR=1
+            ;;
+            "Credentials OK")
+                logmessage  "Credentials OK."
+            ;; 
+            *)
+                #Defensive programming
+                logmessage  "ERROR: Programming Error in checking Credentials"
+                ERROR=1
+            ;;
+        esac
+    else
+        logmessage "ERROR: The sub-script bkup-test-mysql.sh is missing."
+        ## Script can continue ##
+    fi
 fi
 
-##Puts the current Process ID into the runflag
-echo $$ >${RUNFILE}
+if [[ $ERROR -eq 0 ]]; then
+    # Puts the current Process ID into the run flag,
+    # and we save a copy for later
+    PID1=$(echo $$)
+    echo $$ >${RUNFILE}
 
-## findmnt /mnt/sea8tb  >/dev/null 2>&1 ;
-if mountpoint -q /mnt/sea8tb 
-then
-    logmessage  "/mnt/sea8tb is mounted OK."
     dobackup
-    logmessage "$STATUS"
     cleanup_flags
-else
-   logmessage  "ERROR: /mnt/sea8tb is not mounted."
 fi
 
-exit 0
+#Exit without using exit
 
